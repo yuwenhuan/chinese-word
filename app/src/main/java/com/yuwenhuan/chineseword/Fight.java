@@ -1,9 +1,13 @@
 package com.yuwenhuan.chineseword;
 
+import android.app.AlertDialog;
+import android.content.DialogInterface;
+import android.content.Intent;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
 import android.graphics.Matrix;
-import android.media.MediaPlayer;
+import android.media.AudioAttributes;
+import android.media.SoundPool;
 import android.support.v7.app.AppCompatActivity;
 import android.os.Bundle;
 import android.util.Log;
@@ -20,17 +24,15 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.Arrays;
-import java.util.Timer;
-import java.util.TimerTask;
+
 
 public class Fight extends AppCompatActivity implements View.OnClickListener{
     private static final int WORD_LIST_NUM_PER_LESSON = 4; // words per lesson
     private static final int[] BUTTON_ID = {R.id.word1, R.id.word2, R.id.word3, R.id.word4};
     private static final String INDEX_FILENAME = "/index.txt"; // words per lesson
     private static final String TAG = "Fight Activity";
+    private static final String CURRENT_LESSON = "com.yuwenhuan.CURRENT_LESSON";
     private AssetManager assetManager;
-    private MediaPlayer player;
-    private Timer playWordTimer;
     private int currentLesson;
     private int currentWordNum;
     private TextView bullet;
@@ -40,13 +42,24 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
     private ImageView goodGuy;
     private ImageView badGuy;
     private int goodGuyBlood, badGuyBlood;
-    private int goodGuyPivotX, goodGuyPivotY, badGuyPivotX, badGuyPivotY;
-    private TimerTask playWordTask;
+    private SoundPool sp;
+    private int[] wordSoundPoolIds;
+    private int currentWordStreamId;
+    private boolean spLoadReady;
+    private int correctSoundId;
+    private int wrongSoundId;
+    private int explodeSoundId;
+    private int winSoundId;
+    private int looseSoundId;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_fight);
+
+        // get current lesson
+        Intent intent = getIntent();
+        currentLesson = intent.getIntExtra(CURRENT_LESSON, 1);
 
         // initialize
         goodGuy = (ImageView) findViewById(R.id.goodGuy);
@@ -56,22 +69,22 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
         bullet = (TextView) findViewById(R.id.bullet);
         animationBulletToRight = AnimationUtils.loadAnimation(this, R.anim.bullet_to_right);
         animationBulletToLeft = AnimationUtils.loadAnimation(this, R.anim.bullet_to_left);
-        currentLesson = 1;
-        currentWordNum = (int) (Math.random() * 4) + 1;
         goodGuyBlood = 90;
         badGuyBlood = 90;
-        goodGuyPivotX = goodGuy.getDrawable().getBounds().width() / 2;
-        goodGuyPivotY = goodGuy.getDrawable().getBounds().height() / 2;
-        badGuyPivotX = badGuy.getDrawable().getBounds().width() / 2;
-        badGuyPivotY = badGuy.getDrawable().getBounds().height() / 2;
-        player = new MediaPlayer();
-
-
-        // get asset manager
+        AudioAttributes attrs = new AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_GAME)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build();
+        sp = new SoundPool.Builder()
+                .setMaxStreams(3)
+                .setAudioAttributes(attrs)
+                .build();
+        spLoadReady = false;
+        wordSoundPoolIds = new int[WORD_LIST_NUM_PER_LESSON];
         assetManager = getAssets();
 
         // get word List
-        wordList = getWordList(1);
+        wordList = getWordList(currentLesson);
 
         // set buttons
         Button[] buttons = new Button[WORD_LIST_NUM_PER_LESSON];
@@ -82,16 +95,18 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
             buttons[i].setOnClickListener(this);
         }
 
-        // create play word task
-        playWordTask = new TimerTask() {
-            @Override
-            public void run() {
-                playWord(Fight.this.currentLesson, Fight.this.currentWordNum); // But to start with just had this (no cleanup or prepare)
-            }
-        };
+        // select a random word
+        currentWordNum = (int) (Math.random() * WORD_LIST_NUM_PER_LESSON);
 
         // play word
-        startPlayWord();
+        loadSound(1);
+        sp.setOnLoadCompleteListener(new SoundPool.OnLoadCompleteListener() {
+            @Override
+            public void onLoadComplete(SoundPool soundPool, int sampleId, int status) {
+                Fight.this.spLoadReady = true;
+                Fight.this.playWord(currentWordNum);
+            }
+        });
 
         // animation listener
         animationBulletToRight.setAnimationListener(new Animation.AnimationListener() {
@@ -107,6 +122,7 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
             @Override
             public void onAnimationEnd(Animation animation) {
                 bullet.setVisibility(View.INVISIBLE);
+                sp.play(explodeSoundId, 1, 1, 1, 0, 1);
             }
         });
         animationBulletToLeft.setAnimationListener(new Animation.AnimationListener() {
@@ -122,6 +138,7 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
             @Override
             public void onAnimationEnd(Animation animation) {
                 bullet.setVisibility(View.INVISIBLE);
+                sp.play(explodeSoundId, 1, 1, 1, 0, 1);
             }
         });
     }
@@ -149,41 +166,32 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
     }
 
     @Override
-    protected void onStop() {
-        super.onStop();
-        playWordTimer.cancel();
-        player.stop();
-        player.release();
+    protected void onDestroy() {
+        super.onDestroy();
+        sp.release();
     }
 
-    private void playWord(int lesson, int num) {
-        // play word mp3
-        try {
-            String filename = Integer.toString(lesson) + "/" + Integer.toString(num) + ".mp3";
-            AssetFileDescriptor afd = assetManager.openFd(filename);
-            player.reset();
-            player.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
-            player.prepare();
-            player.start();
-            afd.close();
-        } catch (IOException e) {
-            Log.e(TAG, "Play mp3 error.", e);
+    private void loadSound(int lesson) {
+        for (int i=0; i<WORD_LIST_NUM_PER_LESSON; i++) {
+            String filename = Integer.toString(lesson) + "/" + Integer.toString(i + 1) + ".mp3";
+            try {
+                AssetFileDescriptor afd = assetManager.openFd(filename);
+                wordSoundPoolIds[i] = sp.load(afd, 1);
+                afd.close();
+            } catch (IOException e) {
+                Log.e(TAG, "Load word mp3 error.", e);
+            }
         }
+        correctSoundId = sp.load(this, R.raw.correct, 1);
+        wrongSoundId = sp.load(this, R.raw.wrong, 1);
+        explodeSoundId = sp.load(this, R.raw.explode, 1);
+        winSoundId = sp.load(this, R.raw.win, 1);
+        looseSoundId = sp.load(this, R.raw.loose, 1);
     }
 
-    private void playSound(String soundName) {
+    private void playWord(int num) {
         // play word mp3
-        try {
-            String filename = "sound/" + soundName + ".wav";
-            AssetFileDescriptor afd = assetManager.openFd(filename);
-            player.reset();
-            player.setDataSource(afd.getFileDescriptor(), afd.getStartOffset(), afd.getLength());
-            player.prepare();
-            player.start();
-            afd.close();
-        } catch (IOException e) {
-            Log.e(TAG, "Play sound error.", e);
-        }
+        currentWordStreamId = sp.play(wordSoundPoolIds[num], 1, 1, 1, 0, 1);
     }
 
     private String[] getWordList(int num) {
@@ -214,50 +222,87 @@ public class Fight extends AppCompatActivity implements View.OnClickListener{
         return wordList;
     }
 
-    private void startPlayWord() {
-        playWordTimer = new Timer();
-        playWordTimer.schedule(playWordTask, 0, 4000);
-    }
-
-    private void stopPlayWord() {
-        playWordTimer.cancel();
+    private void showGameEndDialog(String title, String message) {
+        AlertDialog alertDialog = new AlertDialog.Builder(this).create();
+        alertDialog.setTitle(title);
+        alertDialog.setMessage(message);
+        alertDialog.setButton(AlertDialog.BUTTON_POSITIVE, "确定",
+                new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int which) {
+                        goodGuyBlood = 90;
+                        badGuyBlood = 90;
+                        goodGuy.setRotation(0);
+                        badGuy.setRotation(0);
+                        // select a random word
+                        currentWordNum = (int) (Math.random() * WORD_LIST_NUM_PER_LESSON);
+                        // play word
+                        Fight.this.playWord(currentWordNum);
+                        dialog.dismiss();
+                    }
+                });
+        alertDialog.setButton(AlertDialog.BUTTON_NEGATIVE, "取消",
+                new DialogInterface.OnClickListener() {
+                    public void onClick(DialogInterface dialog, int which) {
+                        dialog.dismiss();
+                    }
+                });
+        alertDialog.show();
     }
 
     @Override
     public void onClick(View v) {
-        for (int i=0; i<WORD_LIST_NUM_PER_LESSON; i++) {
-            if (v.getId() == BUTTON_ID[i]) {
-                //Log.d(TAG, "button " + Integer.toString(i));
-                if (currentWordNum == i + 1) {
-                    // answer is correct
-                    player.stop();
-                    playSound("correct");
-                    // fire bullet_to_right
-                    bullet.setText(wordList[i]);
-                    bullet.setVisibility(View.VISIBLE);
-                    bullet.startAnimation(animationBulletToRight);
-                    // reduce bad guy's blood
-                    badGuyBlood -= 10;
-                    // rotate bad guy
-                    Matrix matrix = new Matrix();
-                    matrix.postRotate((float) 90 - badGuyBlood, badGuyPivotX, badGuyPivotY);
-                    badGuy.setImageMatrix(matrix);
-                    // choose a new word
-                    currentWordNum = (int) (Math.random() * 4) + 1;
-                } else {
-                    // answer is wrong
-                    player.stop();
-                    playSound("wrong");
-                    // fire bullet_to_left
-                    bullet.setText(wordList[i]);
-                    bullet.setVisibility(View.VISIBLE);
-                    bullet.startAnimation(animationBulletToLeft);
-                    // reduce good guy's blood
-                    goodGuyBlood -= 10;
-                    // rotate good guy
-                    Matrix matrix = new Matrix();
-                    matrix.postRotate((float) 90 - goodGuyBlood, goodGuyPivotX, goodGuyPivotY);
-                    goodGuy.setImageMatrix(matrix);
+        if (spLoadReady) {
+            for (int i = 0; i < WORD_LIST_NUM_PER_LESSON; i++) {
+                if (v.getId() == BUTTON_ID[i]) {
+                    //Log.d(TAG, "button " + Integer.toString(i));
+                    if (currentWordNum == i) {
+                        // answer is correct
+                        // play correct sound
+                        sp.play(correctSoundId, 1, 1, 1, 0, 1);
+                        // fire bullet_to_right
+                        bullet.setText(wordList[i]);
+                        bullet.setVisibility(View.VISIBLE);
+                        bullet.startAnimation(animationBulletToRight);
+                        // reduce bad guy's blood
+                        badGuyBlood -= 10;
+                        // rotate bad guy
+                        int badGuyPivotX = badGuy.getDrawable().getBounds().width() / 2;
+                        int badGuyPivotY = badGuy.getDrawable().getBounds().height() / 2;
+                        badGuy.setPivotX(badGuyPivotX);
+                        badGuy.setPivotY(badGuyPivotY);
+                        badGuy.setRotation(-(90 - badGuyBlood));
+                        if (badGuyBlood > 0) {
+                            // choose a new word
+                            currentWordNum = (currentWordNum + (int) (Math.random() * (WORD_LIST_NUM_PER_LESSON - 1)) + 1) % WORD_LIST_NUM_PER_LESSON;
+                            playWord(currentWordNum);
+                        } else {
+                            // win the game
+                            showGameEndDialog("你赢了", "你赢了，再来一次？");
+                        }
+                    } else {
+                        // answer is wrong
+                        // play wrong sound
+                        sp.play(wrongSoundId, 1, 1, 1, 0, 1);
+                        // fire bullet_to_left
+                        bullet.setText(wordList[i]);
+                        bullet.setVisibility(View.VISIBLE);
+                        bullet.startAnimation(animationBulletToLeft);
+                        // reduce good guy's blood
+                        goodGuyBlood -= 10;
+                        // rotate good guy
+                        int goodGuyPivotX = goodGuy.getDrawable().getBounds().width() / 2;
+                        int goodGuyPivotY = goodGuy.getDrawable().getBounds().height() / 2;
+                        goodGuy.setPivotX(goodGuyPivotX);
+                        goodGuy.setPivotY(goodGuyPivotY);
+                        goodGuy.setRotation(90 - goodGuyBlood);
+                        if (goodGuyBlood > 0) {
+                            // play word again
+                            playWord(currentWordNum);
+                        } else {
+                            // loose the game
+                            showGameEndDialog("你输了", "你输了，再来一次？");
+                        }
+                    }
                 }
             }
         }
